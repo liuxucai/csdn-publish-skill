@@ -1,0 +1,24 @@
+---
+title: {{TITLE}}
+tags: {{TAGS}}
+categories: {{CATEGORY}}
+---
+
+# {{TITLE}}
+
+正文内容（支持 Markdown / 纯文本）...
+
+## 小节1
+
+内容...
+
+## 小节2
+
+内容...
+
+---
+
+# 使用说明
+- `tags`：发布时必填（CSDN 发布对话框「文章标签」为必填项），多个用逗号分隔，如「敬老,随笔」。
+- 发布流程：填充上述 frontmatter → 通过环境变量 CSDN_TITLE / CSDN_BODY / CSDN_TAGS 传入脚本，
+  或由发布脚本读取本模板。
