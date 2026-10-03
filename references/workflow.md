@@ -1,77 +1,90 @@
-# CSDN 发布流程（isolated-browser 路线，已实战验证 2026-07-18）
+# CSDN 发布流程（playwright-core + CKEditor 路线，2026-10-02 实战验证）
+
+> 旧路线（agent-browser --cdp + 主文档 [contenteditable] + .publish-article-modal__footer 弹窗）**已失效**，相关方法已删除。
 
 ## 0. 前置：启动隔离 Chrome
-`scripts/lib.js` 的 `ensureChrome()` 会调用 `isolated-browser/scripts/launch.js` 拉起独立 Chrome（profile `~/.chrome_qclaw_stable`），随后所有操作经 `agent-browser --cdp 9222` 驱动。**不要**用 xb CLI。
 
-## 1. 打开编辑器
-导航至 `https://mp.csdn.net/mp_blog/creation/editor`
+用 isolated-browser skill 的 launch.js 拉起独立 Chrome（CDP 9222）。沙箱会回收 detached 子进程，**必须后台运行并 sleep 保活**：
 
-## 2. 检查登录
-- 已登录（页面存在 `contenteditable` 或标题 input）→ 直接进入第 3 步
-- 未登录（URL 含 passport.csdn.net）→ 调 `doLogin()`：
-  - `navigateTo` 到 `https://passport.csdn.net/account/login`
-  - **真实鼠标**点「验证码登录」tab（别点成页面头部文字）
-  - 原生 setter 填手机号（React 受控组件）
-  - 如有汉字点选验证 → 提示用户手动完成（插→邦→万→木）
-  - **真实鼠标**点「获取验证码」→ 短信到手机
-  - 用户填入 6 位验证码登录
+```bash
+node ~/.workbuddy/skills/isolated-browser/scripts/launch.js "https://mp.csdn.net/mp_blog/creation/editor" && sleep 7200   # run_in_background
+```
+
+依赖：playwright-core（`~/.workbuddy/binaries/node/workspace/node_modules`，运行时设 `NODE_PATH`）。
+
+## 1. 连接与定位页面
+
+```js
+const { chromium } = require('playwright-core');
+const browser = await chromium.connectOverCDP('http://127.0.0.1:9222');
+const ctx = browser.contexts()[0];
+// ⚠️ profile 里可能有残留 tab（B站等），必须按 URL 过滤，不能取 pages()[0]
+const page = ctx.pages().find(p => p.url().includes('mp.csdn.net'));
+await page.bringToFront();   // 被遮挡 tab 的 screenshot 会挂起，先置前
+```
+
+- 登录检查：URL 含 `passport.csdn.net` → 需手动登录（手机号+短信验证码；偶有汉字点选验证需用户完成）
+
+## 2. 等待编辑器就绪（CKEditor）
+
+```js
+await page.waitForFunction(() => window.CKEDITOR && CKEDITOR.instances && CKEDITOR.instances.editor, { timeout: 30000 });
+```
+
+⚠️ 主文档 `[contenteditable]` 数量为 0（编辑器已改版），正文全走 CKEditor API。
 
 ## 3. 填标题
-Vue 受控组件，用原生 setter + input 事件：
 
-```javascript
-var ta = document.getElementById('txtTitle')
-  || document.querySelector('input.article-title-input, input[placeholder*="标题"]');
-var proto = ta.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-var setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
-setter.call(ta, '文章标题');
+`#txtTitle`（textarea，受控组件 → 原生 setter + input/change/keyup/blur 事件）：
+
+```js
+const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
+setter.call(ta, title);
 ['input','change','keyup','blur'].forEach(e => ta.dispatchEvent(new Event(e, {bubbles:true})));
 ```
 
-## 4. 填正文（关键步骤）
-编辑器正文区是 `contenteditable`（Vue 受控组件）：
+## 4. 填正文 + 插图（段落之间）
 
-```javascript
-var editable = document.querySelector('[contenteditable]');
-editable.innerHTML = '<p>段落1</p><p>段落2</p>';
-editable.dispatchEvent(new Event('input', {bubbles:true}));
+```js
+// 4.1 上半部分
+CKEDITOR.instances.editor.setData(partA);
+// 4.2 光标移末尾
+const ed = CKEDITOR.instances.editor; ed.focus();
+const range = ed.createRange(); range.moveToElementEditEnd(ed.editable());
+ed.getSelection().selectRanges([range]);
+// 4.3 paste 插图（base64 → File → DataTransfer → ClipboardEvent）
+const byteStr = atob(b64); /* → Uint8Array → File('image.jpg', {type:'image/jpeg'}) */
+const dt = new DataTransfer(); dt.items.add(file);
+ed.document.$.body.dispatchEvent(new ClipboardEvent('paste', {clipboardData: dt, bubbles:true, cancelable:true}));
+// 4.4 轮询 ed.getData().includes('<img')（约 1~2 分钟内上传完成，src 变 i-blog.csdnimg.cn 外链）
+// 4.5 光标再移末尾，ed.insertHtml(partB)  ← 图片即落在段落之间
 ```
 
-- ⚠️ 旧文档里的 `CKEDITOR.instances['editor'].setData()` 在新版编辑器上**不可靠**（字数可能仍显示 0），仅作兜底。
-- ❌ 不要直接 `document.querySelector('[contenteditable]').innerHTML = ...` 后**不**派发 `input` 事件（Vue 读不到）。
-- HTML 换行：段落用 `<p>`，段内换行用 `<br>`。
+❌ 不可行：工具栏「图像」按钮（boundingBox 全 0）、`input[type=file]` 直填（CKEditor 上传对话框不可靠）。
 
-## 5. 发布（两步，真实鼠标）
-### 5.1 打开发布对话框
-真实鼠标点编辑器底部状态栏的「发布文章」按钮（中心约视口 `(713,577)`，但实际请用 `getBoundingClientRect()` 取实时中心）。对话框出现 `.publish-article-modal__footer`。
+## 5. 打开发文设置面板
 
-### 5.2 加标签（必填！否则静默拦截）
-```javascript
-// 真实鼠标点「添加文章标签」
-// 弹层搜索框 input[placeholder*='搜索'] 用 agent-browser fill 输入标签词
-// 再 press Enter 生成 chip（弹层不关闭、也不要按 Escape）
-```
-- ⚠️ **「文章标签」是必填**（红色 `*`）。空标签点发布会被**静默拦截**：无报错、无 toast、对话框不关、URL 不变。
-- ⚠️ **不要按 `Escape`** 关标签弹层——`Escape` 会整体取消整个发布对话框并丢弃已加标签。
-- ⚠️ 标签入口是弹出的搜索框（自定义标签 + Enter），不是隐藏 checkbox（`.tag__option-chk` 勾选无效）。
+- 真实鼠标点击**顶部工具栏**「发布文章」（`getBoundingClientRect().y < 80`，取元素中心）
+- 展开的是**内联设置面板**（无 modal、无 `.publish-article-modal__footer`）
+- ⚠️ 右侧 AI助手面板可能遮挡设置面板 → 其下方元素点击报 "intercepts pointer events"，先关 AI 面板
 
-### 5.3 点最终发布
-真实鼠标点发布对话框 footer 最右的「发布文章」按钮（中心约 `(913,577)`，实际取实时中心）。标签弹层开着也不影响点击 footer 按钮。
+## 6. 加文章标签（必填！）
 
-## 6. 判定发布成功
-- URL 变为 `https://mp.csdn.net/mp_blog/creation/success/{articleId}`
-- 页面显示「发布成功！正在审核中」
-- 文章链接：`https://blog.csdn.net/<uid>/article/details/{articleId}`（从成功页「查看文章」拿）
+1. 点「添加文章标签」——入口常在视口外（y≈1156），**先 `scrollIntoView({block:'center'})` 再真实鼠标点击**
+2. 弹「标签」对话框，搜索框 placeholder=`请输入文字搜索，Enter键可添加自定义标签`
+   ⚠️ 用 placeholder 含「请输入文字搜索」精确匹配；泛化匹配 `input[type=text]` 会误中「创作话题」下拉
+3. `click → fill('') → type(标签词) → Enter` 生成 chip；重复加多个标签
+4. 验证：文档标签行出现 chip（如 `婚庆用车 ×`）；完成后对话框 × 关闭
 
-## 7. 关键陷阱（实战踩过）
-1. **Vue/React 受控组件**：填值用原生 setter + `dispatchEvent('input')`；按钮用**真实鼠标**点击。`dispatchEvent('click')` 对 Vue `@click` 无效。
-2. **点击坐标取中心**：`getBoundingClientRect()` 的 `left/top` 是左上角，点中心要 `x+width/2, y+height/2`。
-3. **多 tab 跑错 eval**：若曾 `open` 过管理页 tab，eval/click 会作用在错误 tab，造成「对话框没开」假象。操作前确认激活的是编辑器 tab。
-4. **视口坐标漂移**：多 tab / 窗口切换后固定坐标会漂移，每次点击前重新取实时坐标。
-5. **标签必填静默拦截**：空标签点发布无任何反应，必须先加标签。
-6. **Escape 误取消对话框**：加完标签直接点发布即可，别按 Escape。
-7. **标签 picker 行为**：`Enter` 提交标签后弹层不自动关闭，这是正常的，无需额外处理。
+❌ 不可行：隐藏 `.tag__option-chk` checkbox（假入口）；`Escape` 关弹层。
+
+## 7. 发布
+
+- 滚动到面板底部，真实鼠标点**「发布博客」**（橙色按钮）
+- 成功判定：URL 跳转 `mp.csdn.net/mp_blog/creation/success/{articleId}`；页面提示「发布成功！正在审核中」
+- 文章链接：`blog.csdn.net/<uid>/article/details/{articleId}`
 
 ## 8. 已验证案例
-- 2026-07-04：成功发布《世界和平：从理解开始》(944字)，文章ID 162552874（旧 CKEditor 路线）
-- 2026-07-18：成功发布《敬老，是藏在三件小事里的日常修行》，文章ID 162989125（isolated-browser 路线，标签「敬老」必填已验证）
+
+- **2026-10-02：《婚车租车怎么选才不踩坑？头车、车队、价格全攻略》，文章ID 166991170**
+  （814 字 + 宾利婚车配图插在第二/三节之间 + 标签「婚庆用车、婚庆婚车车队」；publish_pw.js 全流程跑通）
